@@ -1,0 +1,51 @@
+{
+  "name": "@thryx/elizaos-plugin",
+  "version": "0.1.1",
+  "description": "ElizaOS plugin for ThryxProtocol — launch, buy, sell tokens and claim fees on Base",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "README.md",
+    "images/"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --outDir dist --clean",
+    "dev": "tsup src/index.ts --format esm --dts --outDir dist --watch",
+    "lint": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@elizaos/core": ">=0.2.0"
+  },
+  "dependencies": {
+    "ethers": "^6.0.0"
+  },
+  "devDependencies": {
+    "@elizaos/core": "^1.7.2",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "elizaos",
+    "elizaos-plugin",
+    "thryx",
+    "thryxprotocol",
+    "token-launch",
+    "base",
+    "defi",
+    "bonding-curve",
+    "ai-agent",
+    "launchpad"
+  ],
+  "author": "ThryxProtocol <team@thryx.xyz>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lordbasilaiassistant-sudo/thryx-elizaos"
+  },
+  "homepage": "https://thryx.xyz",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
