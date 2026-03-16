@@ -1,6 +1,6 @@
 {
   "name": "@thryx/elizaos-plugin",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "description": "ElizaOS plugin for ThryxProtocol — launch, buy, sell tokens and claim fees on Base",
   "type": "module",
   "main": "dist/index.js",

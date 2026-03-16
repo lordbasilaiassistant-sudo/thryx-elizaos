@@ -70,7 +70,7 @@ export const sellAction: Action = {
     _message: Memory
   ): Promise<boolean> => {
     const key =
-      runtime.getSetting("THRYX_PRIVATE_KEY") ||
+      runtime.getSetting("PRIVATE_KEY") ||
       runtime.getSetting("EVM_PRIVATE_KEY");
     return !!key;
   },

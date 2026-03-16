@@ -7,14 +7,31 @@ var RPC_URL = "https://mainnet.base.org";
 var PROTOCOL_ADDRESS = "0x2F77b40c124645d25782CfBdfB1f54C1d76f2cCe";
 var THRYX_ADDRESS = "0xc07E889e1816De2708BF718683e52150C20F3BA3";
 var WETH_ADDRESS = "0x4200000000000000000000000000000000000006";
+var RELAY_URL = "https://thryx-relay.thryx.workers.dev";
 var PROTOCOL_ABI = [
   "function launch(string name, string symbol) external returns (address)",
   "function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) external payable returns (uint256)",
   "function estimateSwap(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256)",
   "function getCurveInfo(address token) external view returns (address deployer, uint256 spotPrice, uint256 raised, uint256 threshold, uint256 progressBps, uint256 tokensSold, uint256 tokensAvailable, bool graduated, address aeroPool, uint256 creatorFees, uint256 protocolFees)",
   "function getProtocolStats() external view returns (uint256 launched, uint256 graduated, uint256 lifetimeFees, uint256 thryxReserves, uint256 ethReserves, uint256 ethRate)",
-  "function claimCreatorFees(address token) external returns (uint256)"
+  "function claimCreatorFees(address token) external returns (uint256)",
+  "function metaNonce(address) view returns (uint256)"
 ];
+var META_LAUNCH_DOMAIN = {
+  name: "ThryxProtocol",
+  version: "1",
+  chainId: CHAIN_ID,
+  verifyingContract: PROTOCOL_ADDRESS
+};
+var META_LAUNCH_TYPES = {
+  MetaLaunch: [
+    { name: "name", type: "string" },
+    { name: "symbol", type: "string" },
+    { name: "user", type: "address" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" }
+  ]
+};
 var ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
@@ -26,10 +43,10 @@ var DEFAULT_SLIPPAGE_BPS = 1e3;
 
 // src/utils.ts
 function getPrivateKey(runtime) {
-  const key = runtime.getSetting("THRYX_PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
+  const key = runtime.getSetting("PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
   if (!key || typeof key !== "string") {
     throw new Error(
-      "No private key configured. Set THRYX_PRIVATE_KEY or EVM_PRIVATE_KEY in your agent settings."
+      "No private key configured. Set PRIVATE_KEY or EVM_PRIVATE_KEY in your agent settings."
     );
   }
   return key;
@@ -73,6 +90,70 @@ function shortAddress(address) {
 function shortHash(hash) {
   return `${hash.slice(0, 10)}...${hash.slice(-4)}`;
 }
+async function getMetaNonce(userAddress) {
+  const provider = getProvider();
+  const protocol = new ethers.Contract(PROTOCOL_ADDRESS, PROTOCOL_ABI, provider);
+  return protocol.metaNonce(userAddress);
+}
+async function signMetaLaunch(wallet, name, symbol, deadlineSeconds = 300) {
+  const nonce = await getMetaNonce(wallet.address);
+  const deadline = BigInt(Math.floor(Date.now() / 1e3) + deadlineSeconds);
+  const message = {
+    name,
+    symbol,
+    user: wallet.address,
+    nonce,
+    deadline
+  };
+  const sig = await wallet.signTypedData(
+    META_LAUNCH_DOMAIN,
+    META_LAUNCH_TYPES,
+    message
+  );
+  const { v, r, s } = ethers.Signature.from(sig);
+  return {
+    name,
+    symbol,
+    user: wallet.address,
+    nonce: nonce.toString(),
+    deadline: deadline.toString(),
+    v,
+    r,
+    s
+  };
+}
+async function submitMetaLaunch(payload) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6e4);
+  try {
+    const res = await fetch(`${RELAY_URL}/relay/launch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      return {
+        success: false,
+        error: data.error || data.message || `Relay returned ${res.status}`
+      };
+    }
+    return {
+      success: true,
+      txHash: data.txHash || data.hash,
+      token: data.token || data.tokenAddress
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("abort")) {
+      return { success: false, error: "Relay request timed out (60s)" };
+    }
+    return { success: false, error: msg };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // src/actions/launch.ts
 var examples = [
@@ -86,7 +167,7 @@ var examples = [
     {
       name: "agent",
       content: {
-        text: "Launching Degen Cats (DCAT) on ThryxProtocol...\n\nToken deployed!\nAddress: 0x1234...abcd\nTx: 0xabcd...1234\n\nYour token is now live on the bonding curve. Share it and let people trade!",
+        text: "Launching Degen Cats (DCAT) gaslessly via ThryxProtocol relay...\n\nToken deployed!\nAddress: 0x1234...abcd\nTx: 0xabcd...1234\n\nYour token is now live on the bonding curve. No gas was spent!",
         actions: ["THRYX_LAUNCH"]
       }
     }
@@ -101,15 +182,149 @@ var examples = [
     {
       name: "agent",
       content: {
-        text: "Deploying Based AI Agent (BAIA) on ThryxProtocol...\n\nToken launched successfully!\nAddress: 0x5678...efgh\nTx: 0xefgh...5678\n\nThe token is live on a bonding curve. Cost: ~$0.01 gas.",
+        text: "Deploying Based AI Agent (BAIA) gaslessly via ThryxProtocol relay...\n\nToken launched successfully!\nAddress: 0x5678...efgh\nTx: 0xefgh...5678\n\nThe token is live on a bonding curve. Zero gas cost \u2014 the relay paid for you!",
         actions: ["THRYX_LAUNCH"]
       }
     }
   ]
 ];
+function parseNameAndSymbol(text) {
+  let name = null;
+  let symbol = null;
+  const parenMatch = text.match(
+    /(?:launch|create|deploy|mint)\s+(?:a\s+)?(?:new\s+)?(?:token\s+)?(?:called\s+|named\s+)?["']?(.+?)["']?\s*[\(\[]\s*([A-Z0-9]{2,10})\s*[\)\]]/i
+  );
+  if (parenMatch) {
+    name = parenMatch[1].trim();
+    symbol = parenMatch[2].toUpperCase();
+  }
+  if (!symbol) {
+    const withMatch = text.match(
+      /(?:launch|create|deploy|mint)\s+(?:a\s+)?(?:new\s+)?(?:token\s+)?(?:called\s+|named\s+)?["']?(.+?)["']?\s+(?:with\s+)?(?:symbol|ticker)\s+["']?([A-Z0-9]{2,10})["']?/i
+    );
+    if (withMatch) {
+      name = withMatch[1].trim();
+      symbol = withMatch[2].toUpperCase();
+    }
+  }
+  if (!symbol) {
+    const simpleMatch = text.match(
+      /(?:launch|create|deploy|mint)\s+(?:a\s+)?(?:new\s+)?(?:token\s+)?(?:called\s+|named\s+)?["']?(.+?)\s+([A-Z][A-Z0-9]{1,9})["']?\s*$/i
+    );
+    if (simpleMatch) {
+      name = simpleMatch[1].trim();
+      symbol = simpleMatch[2].toUpperCase();
+    }
+  }
+  if (!symbol) {
+    const colonMatch = text.match(
+      /name[:\s]+["']?(.+?)["']?\s*[,;]\s*symbol[:\s]+["']?([A-Z0-9]{2,10})["']?/i
+    );
+    if (colonMatch) {
+      name = colonMatch[1].trim();
+      symbol = colonMatch[2].toUpperCase();
+    }
+  }
+  if (!symbol) {
+    const colonMatch2 = text.match(
+      /symbol[:\s]+["']?([A-Z0-9]{2,10})["']?\s*[,;]\s*name[:\s]+["']?(.+?)["']?$/i
+    );
+    if (colonMatch2) {
+      symbol = colonMatch2[1].toUpperCase();
+      name = colonMatch2[2].trim();
+    }
+  }
+  if (!name || !symbol) return null;
+  name = name.replace(/\s+(with|and|the|a|an)\s*$/i, "").trim();
+  return { name, symbol };
+}
+function extractTokenFromReceipt(receipt, protocolInterface) {
+  for (const log of receipt.logs) {
+    try {
+      const parsed = protocolInterface.parseLog({
+        topics: log.topics,
+        data: log.data
+      });
+      if (parsed && parsed.name === "TokenLaunched") {
+        return parsed.args[0] || parsed.args.token || "";
+      }
+    } catch {
+    }
+  }
+  for (const log of receipt.logs) {
+    if (log.topics[0] === "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") {
+      if (log.address && log.address.toLowerCase() !== PROTOCOL_ADDRESS.toLowerCase()) {
+        return log.address;
+      }
+    }
+  }
+  return "";
+}
+async function launchGasless(runtime, name, symbol, callback) {
+  const wallet = getWallet(runtime);
+  if (callback) {
+    await callback({
+      text: `Launching **${name}** (${symbol}) gaslessly via ThryxProtocol relay...
+
+Signer: ${shortAddress(wallet.address)}
+Relay: ${RELAY_URL}`
+    });
+  }
+  const signed = await signMetaLaunch(wallet, name, symbol, 300);
+  const result = await submitMetaLaunch({
+    name: signed.name,
+    symbol: signed.symbol,
+    user: signed.user,
+    deadline: signed.deadline,
+    v: signed.v,
+    r: signed.r,
+    s: signed.s
+  });
+  if (!result.success) {
+    return {
+      success: false,
+      deployer: wallet.address,
+      method: "gasless",
+      error: result.error || "Relay rejected the request"
+    };
+  }
+  return {
+    success: true,
+    tokenAddress: result.token || "",
+    txHash: result.txHash || "",
+    deployer: wallet.address,
+    method: "gasless"
+  };
+}
+async function launchDirect(runtime, name, symbol, callback) {
+  const wallet = getWallet(runtime);
+  const protocol = getProtocol(wallet);
+  if (callback) {
+    await callback({
+      text: `Gasless relay unavailable. Launching **${name}** (${symbol}) directly on-chain...
+
+Deployer: ${shortAddress(wallet.address)}
+Note: This will cost gas (~$0.01 on Base).`
+    });
+  }
+  const tx = await protocol.launch(name, symbol);
+  const receipt = await tx.wait();
+  const tokenAddress = extractTokenFromReceipt(
+    receipt,
+    protocol.interface
+  );
+  return {
+    success: true,
+    tokenAddress,
+    txHash: receipt.hash,
+    deployer: wallet.address,
+    gasUsed: receipt.gasUsed.toString(),
+    method: "direct"
+  };
+}
 var launchAction = {
   name: "THRYX_LAUNCH",
-  description: "Launch a new token on ThryxProtocol (Base mainnet). Creates a bonding curve token with the given name and symbol. Costs only gas (~$0.01 on Base).",
+  description: "Launch a new token on ThryxProtocol (Base mainnet). Uses gasless metaLaunch by default (zero gas cost via relay). Falls back to direct on-chain launch if the relay is unavailable.",
   similes: [
     "LAUNCH_TOKEN",
     "CREATE_TOKEN",
@@ -117,126 +332,80 @@ var launchAction = {
     "THRYX_DEPLOY",
     "MINT_TOKEN",
     "LAUNCH_THRYX_TOKEN",
-    "CREATE_THRYX_TOKEN"
+    "CREATE_THRYX_TOKEN",
+    "GASLESS_LAUNCH",
+    "META_LAUNCH",
+    "FREE_LAUNCH"
   ],
   examples,
   validate: async (runtime, _message) => {
-    const key = runtime.getSetting("THRYX_PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
+    const key = runtime.getSetting("PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
     return !!key;
   },
   handler: async (runtime, message, _state, _options, callback) => {
     const text = message.content.text || "";
-    let name = null;
-    let symbol = null;
-    const parenMatch = text.match(
-      /(?:launch|create|deploy|mint)\s+(?:a\s+)?(?:new\s+)?(?:token\s+)?(?:called\s+|named\s+)?["']?(.+?)["']?\s*[\(\[]\s*([A-Z0-9]{2,10})\s*[\)\]]/i
-    );
-    if (parenMatch) {
-      name = parenMatch[1].trim();
-      symbol = parenMatch[2].toUpperCase();
-    }
-    if (!symbol) {
-      const withMatch = text.match(
-        /(?:launch|create|deploy|mint)\s+(?:a\s+)?(?:new\s+)?(?:token\s+)?(?:called\s+|named\s+)?["']?(.+?)["']?\s+(?:with\s+)?(?:symbol|ticker)\s+["']?([A-Z0-9]{2,10})["']?/i
-      );
-      if (withMatch) {
-        name = withMatch[1].trim();
-        symbol = withMatch[2].toUpperCase();
-      }
-    }
-    if (!symbol) {
-      const simpleMatch = text.match(
-        /(?:launch|create|deploy|mint)\s+(?:a\s+)?(?:new\s+)?(?:token\s+)?(?:called\s+|named\s+)?["']?(.+?)\s+([A-Z][A-Z0-9]{1,9})["']?\s*$/i
-      );
-      if (simpleMatch) {
-        name = simpleMatch[1].trim();
-        symbol = simpleMatch[2].toUpperCase();
-      }
-    }
-    if (!symbol) {
-      const colonMatch = text.match(/name[:\s]+["']?(.+?)["']?\s*[,;]\s*symbol[:\s]+["']?([A-Z0-9]{2,10})["']?/i);
-      if (colonMatch) {
-        name = colonMatch[1].trim();
-        symbol = colonMatch[2].toUpperCase();
-      }
-    }
-    if (!symbol) {
-      const colonMatch2 = text.match(/symbol[:\s]+["']?([A-Z0-9]{2,10})["']?\s*[,;]\s*name[:\s]+["']?(.+?)["']?$/i);
-      if (colonMatch2) {
-        symbol = colonMatch2[1].toUpperCase();
-        name = colonMatch2[2].trim();
-      }
-    }
-    if (!name || !symbol) {
+    const parsed = parseNameAndSymbol(text);
+    if (!parsed) {
       if (callback) {
         await callback({
           text: 'I need both a token name and symbol to launch. Try something like:\n- "Launch Degen Cats with symbol DCAT"\n- "Create a token called Based AI (BAIA)"'
         });
       }
-      return { success: false, error: "Could not parse token name and symbol from message" };
+      return {
+        success: false,
+        error: "Could not parse token name and symbol from message"
+      };
     }
-    name = name.replace(/\s+(with|and|the|a|an)\s*$/i, "").trim();
+    const { name, symbol } = parsed;
     try {
-      const wallet = getWallet(runtime);
-      const protocol = getProtocol(wallet);
-      if (callback) {
-        await callback({
-          text: `Launching **${name}** (${symbol}) on ThryxProtocol...
+      let result = await launchGasless(runtime, name, symbol, callback);
+      if (!result.success) {
+        const relayError = result.error;
+        try {
+          result = await launchDirect(runtime, name, symbol, callback);
+        } catch (directErr) {
+          const directMsg = directErr instanceof Error ? directErr.message : String(directErr);
+          if (callback) {
+            await callback({
+              text: `Failed to launch token.
 
-Deployer: ${shortAddress(wallet.address)}`
-        });
-      }
-      const tx = await protocol.launch(name, symbol);
-      const receipt = await tx.wait();
-      let tokenAddress = "";
-      if (receipt.logs && receipt.logs.length > 0) {
-        for (const log of receipt.logs) {
-          try {
-            const parsed = protocol.interface.parseLog({
-              topics: log.topics,
-              data: log.data
+Gasless relay error: ${relayError}
+Direct launch error: ${directMsg}`
             });
-            if (parsed && parsed.name === "TokenLaunched") {
-              tokenAddress = parsed.args[0] || parsed.args.token;
-              break;
-            }
-          } catch {
           }
-        }
-        if (!tokenAddress) {
-          for (const log of receipt.logs) {
-            if (log.topics[0] === "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") {
-              if (log.address && log.address.toLowerCase() !== PROTOCOL_ADDRESS.toLowerCase()) {
-                tokenAddress = log.address;
-                break;
-              }
-            }
-          }
+          return {
+            success: false,
+            error: `Gasless: ${relayError} | Direct: ${directMsg}`
+          };
         }
       }
-      const result = {
+      const output = {
         success: true,
         name,
         symbol,
-        tokenAddress: tokenAddress || "Check tx receipt for token address",
-        txHash: receipt.hash,
-        deployer: wallet.address,
-        gasUsed: receipt.gasUsed.toString()
+        tokenAddress: result.tokenAddress || "Check tx receipt for token address",
+        txHash: result.txHash || "",
+        deployer: result.deployer || "",
+        method: result.method || "gasless",
+        gasUsed: result.gasUsed || "0 (gasless)"
       };
       if (callback) {
+        const methodLabel = result.method === "gasless" ? "Gasless (zero gas cost)" : `Direct (gas used: ${result.gasUsed})`;
         await callback({
-          text: `Token launched successfully!
-
-**${name}** (${symbol})
-Address: \`${tokenAddress || "see tx"}\`
-Tx: \`${shortHash(receipt.hash)}\`
-Gas used: ${receipt.gasUsed.toString()}
-
-The token is live on a bonding curve. Anyone can buy and sell it now.
-View on Basescan: https://basescan.org/tx/${receipt.hash}`
+          text: [
+            "Token launched successfully!",
+            "",
+            `**${name}** (${symbol})`,
+            `Address: \`${result.tokenAddress || "see tx"}\``,
+            `Tx: \`${result.txHash ? shortHash(result.txHash) : "pending"}\``,
+            `Method: ${methodLabel}`,
+            "",
+            "The token is live on a bonding curve. Anyone can buy and sell it now.",
+            result.txHash ? `View on Basescan: https://basescan.org/tx/${result.txHash}` : ""
+          ].filter(Boolean).join("\n")
         });
       }
-      return result;
+      return output;
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       if (callback) {
@@ -295,7 +464,7 @@ var buyAction = {
   ],
   examples: examples2,
   validate: async (runtime, _message) => {
-    const key = runtime.getSetting("THRYX_PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
+    const key = runtime.getSetting("PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
     return !!key;
   },
   handler: async (runtime, message, _state, _options, callback) => {
@@ -456,7 +625,7 @@ var sellAction = {
   ],
   examples: examples3,
   validate: async (runtime, _message) => {
-    const key = runtime.getSetting("THRYX_PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
+    const key = runtime.getSetting("PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
     return !!key;
   },
   handler: async (runtime, message, _state, _options, callback) => {
@@ -738,7 +907,7 @@ var claimAction = {
   ],
   examples: examples5,
   validate: async (runtime, _message) => {
-    const key = runtime.getSetting("THRYX_PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
+    const key = runtime.getSetting("PRIVATE_KEY") || runtime.getSetting("EVM_PRIVATE_KEY");
     return !!key;
   },
   handler: async (runtime, message, _state, _options, callback) => {
@@ -831,7 +1000,7 @@ var protocolProvider = {
         feeSplit: "70% creator / 30% protocol"
       };
       const text = [
-        "ThryxProtocol v2.3 (Base mainnet)",
+        "ThryxProtocol v2.4 Diamond (Base mainnet)",
         `Contract: ${PROTOCOL_ADDRESS}`,
         `Tokens launched: ${data.launched}`,
         `Tokens graduated: ${data.graduated}`,
@@ -865,8 +1034,11 @@ export {
   CHAIN_ID,
   DEFAULT_SLIPPAGE_BPS,
   ERC20_ABI,
+  META_LAUNCH_DOMAIN,
+  META_LAUNCH_TYPES,
   PROTOCOL_ABI,
   PROTOCOL_ADDRESS,
+  RELAY_URL,
   RPC_URL,
   THRYX_ADDRESS,
   WETH_ADDRESS,
@@ -876,6 +1048,7 @@ export {
   index_default as default,
   formatTokenAmount,
   getERC20,
+  getMetaNonce,
   getProtocol,
   getProvider,
   getWallet,
@@ -887,5 +1060,7 @@ export {
   sellAction,
   shortAddress,
   shortHash,
+  signMetaLaunch,
+  submitMetaLaunch,
   thryxPlugin
 };
